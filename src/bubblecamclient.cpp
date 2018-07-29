@@ -26,13 +26,15 @@
  *  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#define QT_NO_CAST_FROM_ASCII
+
 #include "bubblecamclient.h"
 
 #include <QDateTime>
 #include <QTcpSocket>
 #include <QTimer>
 
-#include <QLoggingCategory>
+#include <chrono>
 
 #define REQUEST "GET /bubble/live?ch=0&stream=0 HTTP/1.1\r\n\r\n"
 #define REPLY_FAIL_TIMEOUT 5 * 1000
@@ -42,15 +44,11 @@
 #define DEFAULT_USER "admin"
 #define DEFAULT_CHANNEL 0
 
-QLoggingCategory category("BubbleCamClient");
-
-#define DEBUG qCDebug(category)
-
-template <typename T>
-quint32 packageSize()
-{
-    return sizeof(T) - sizeof(PackageHeader::magic) - sizeof(PackageHeader::length_be);
-}
+#include <QLoggingCategory>
+Q_LOGGING_CATEGORY(bubbleCamClientLog, "bubblecam.BubbleCamClient", QtWarningMsg)
+#define DEBUG qCDebug(bubbleCamClientLog())
+#define WARNING qCWarning(bubbleCamClientLog())
+#define INFO qCInfo(bubbleCamClientLog())
 
 enum class PackageType : qint8 {
     Message = 0x00,
@@ -70,6 +68,9 @@ enum class MessageType : qint8 {
 
 enum class MediaType : qint8 { Audio = 0x00, Idr, PSlice };
 
+template <typename T>
+quint32 packageSize();
+
 #pragma pack(push, 1)
 struct PackageHeader
 {
@@ -80,9 +81,11 @@ struct PackageHeader
 
     PackageHeader()
     {
-        // Should be microseconds since epoch, but it's not possible to fit them into 32 bits
-        auto secs = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
-        timestamp_be = qToBigEndian<quint32>(secs);
+        qint64 microsecs = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        // We truncate the most significant bits, as they won't fit into 32 bits
+        timestamp_be = qToBigEndian<quint32>(static_cast<quint32>(microsecs));
     }
 };
 
@@ -161,6 +164,12 @@ struct MediaMessage
 };
 #pragma pack(pop)
 
+template <typename T>
+quint32 packageSize()
+{
+    return sizeof(T) - sizeof(PackageHeader::magic) - sizeof(PackageHeader::length_be);
+}
+
 BubbleCamClient::BubbleCamClient() {}
 
 BubbleCamClient::ErrorCode BubbleCamClient::startStreaming(const QHostAddress &hostName,
@@ -168,6 +177,9 @@ BubbleCamClient::ErrorCode BubbleCamClient::startStreaming(const QHostAddress &h
                                                            const QString &password, quint8 channel,
                                                            quint8 stream)
 {
+    if (m_streaming)
+        return ErrorCode::AlreadyStreaming;
+
     if (user.length() > 20 || password.length() > 20)
         return ErrorCode::UsernameOrPasswordTooLong;
 
@@ -179,7 +191,7 @@ BubbleCamClient::ErrorCode BubbleCamClient::startStreaming(const QHostAddress &h
     socket->write(REQUEST);
     if (!socket->waitForBytesWritten())
         return ErrorCode::WriteTimeout;
-    if (!socket->waitForReadyRead())
+    if (!socket->waitForReadyRead(REPLY_FAIL_TIMEOUT))
         return ErrorCode::ReadTimeout;
 
     QByteArray reply = socket->readAll();
@@ -194,17 +206,14 @@ BubbleCamClient::ErrorCode BubbleCamClient::startStreaming(const QHostAddress &h
     strcpy(auth.pass, password.toUtf8().constData());
 
     QByteArray auth_package(reinterpret_cast<char *>(&auth), sizeof(AuthMessage));
-    DEBUG << auth_package.size() << auth_package.toHex(' ');
+    DEBUG << auth_package.size() << auth_package.toHex();
     socket->write(auth_package);
     if (!socket->waitForBytesWritten())
         return ErrorCode::WriteTimeout;
-    if (!socket->waitForReadyRead(REPLY_FAIL_TIMEOUT)) {
-        // It seems that when auth fails, you won't get any
-        // reply and the connection will simply timeout.
-        return ErrorCode::AuthenticationFailed;
-    }
+    if (!socket->waitForReadyRead(REPLY_FAIL_TIMEOUT))
+        return ErrorCode::ReadTimeout;
     reply = socket->readAll();
-    DEBUG << reply.size() << reply.toHex(' ');
+    DEBUG << reply.size() << reply.toHex();
 
     if (!reply.startsWith('\xaa'))
         return ErrorCode::UnexpectedReply;
@@ -219,7 +228,7 @@ BubbleCamClient::ErrorCode BubbleCamClient::startStreaming(const QHostAddress &h
         const AuthMessageReply *authReply =
             reinterpret_cast<const AuthMessageReply *>(reply.constData());
         if (authReply->verify == 0)
-            return ErrorCode::UnexpectedReply;
+            return ErrorCode::AuthenticationFailed;
     }
 
     OpenStreamMessage open_stream;
@@ -229,7 +238,7 @@ BubbleCamClient::ErrorCode BubbleCamClient::startStreaming(const QHostAddress &h
 
     QByteArray open_stream_package(reinterpret_cast<char *>(&open_stream),
                                    sizeof(OpenStreamMessage));
-    DEBUG << open_stream_package.size() << open_stream_package.toHex(' ');
+    DEBUG << open_stream_package.size() << open_stream_package.toHex();
     socket->write(open_stream_package);
     if (!socket->waitForBytesWritten())
         return ErrorCode::WriteTimeout;
@@ -247,7 +256,8 @@ BubbleCamClient::ErrorCode BubbleCamClient::startStreaming(const QHostAddress &h
             SLOT(onError(QAbstractSocket::SocketError)));
 
     m_heartbeatTimer.reset(new QTimer());
-    connect(m_heartbeatTimer.data(), &QTimer::timeout, this, &BubbleCamClient::onHeartbeatTimeout);
+    connect(m_heartbeatTimer.data(), &QTimer::timeout, this,
+            &BubbleCamClient::onHeartbeatTimerTimeout);
     m_heartbeatTimer->start(HEARTBEAT_INTERVAL);
 
     return ErrorCode::NoError;
@@ -287,7 +297,7 @@ void BubbleCamClient::stopStreaming()
 
         QByteArray open_stream_package(reinterpret_cast<char *>(&open_stream),
                                        sizeof(OpenStreamMessage));
-        DEBUG << open_stream_package.size() << open_stream_package.toHex(' ');
+        DEBUG << open_stream_package.size() << open_stream_package.toHex();
         m_socket->write(open_stream_package);
         if (!m_socket->waitForBytesWritten()) {
             m_socket->close();
@@ -313,12 +323,20 @@ BubbleCamClient::~BubbleCamClient()
 int BubbleCamClient::processMessage(const QByteArray &data)
 {
     const MediaMessage *message = reinterpret_cast<const MediaMessage *>(data.constData());
-    const quint32 size = qFromBigEndian(message->length_be);
+    const qint32 size = static_cast<qint32>(qFromBigEndian<quint32>(message->length_be));
 
     DEBUG << "Got message" << qint8(message->header.packageType) << qint8(message->mediaType)
           << size;
 
     if (message->header.packageType != PackageType::Media) {
+        WARNING << "Package not of Media type:" << qint8(message->header.packageType);
+        if (bubbleCamClientLog().isDebugEnabled()
+            && message->header.packageType == PackageType::Message
+            && data.size() >= sizeof(Message)) {
+            const Message *message = reinterpret_cast<const Message *>(data.constData());
+            DEBUG << qint8(message->messageType) << data.size()
+                  << data.left(sizeof(Message)).toHex();
+        }
         return emitData(data.left(1));
     }
 
@@ -330,17 +348,17 @@ int BubbleCamClient::processMessage(const QByteArray &data)
 
     switch (message->mediaType) {
     case MediaType::Audio:
-        //        DEBUG << "Audio size:" << messageData.size();
+        DEBUG << "Audio size:" << messageData.size();
         emit audioStream(messageData);
         audioActive = true;
         break;
     case MediaType::Idr:
     case MediaType::PSlice:
-        //        DEBUG << "Video size:" << messageData.size();
+        DEBUG << "Video size:" << messageData.size();
         emit videoStream(messageData);
         break;
     default:
-        DEBUG << "Unknown media type" << qint8(message->mediaType);
+        WARNING << "Unknown media type:" << qint8(message->mediaType);
         return emitData(data.left(1));
     }
     return sizeof(MediaMessage) + messageData.size();
@@ -348,7 +366,7 @@ int BubbleCamClient::processMessage(const QByteArray &data)
 
 int BubbleCamClient::emitData(const QByteArray &data)
 {
-    packet_left -= data.size();
+    packet_left = qMax(0, packet_left - data.size());
     if (audioActive) {
         emit audioStream(data);
     } else {
@@ -359,7 +377,7 @@ int BubbleCamClient::emitData(const QByteArray &data)
 
 void BubbleCamClient::onReadyRead()
 {
-    const QByteArray data = m_socket->readAll();
+    QByteArray data = m_socket->readAll();
     //    DEBUG << data.size();
 
     int offset = 0;
@@ -370,19 +388,27 @@ void BubbleCamClient::onReadyRead()
             offset = newOffset;
         }
 
-        if (data.mid(offset).startsWith('\xaa'))
-            offset += processMessage(data.mid(offset));
-        else
-            offset += emitData(data.mid(offset));
+        QByteArray mid = data.mid(offset);
+        if (mid.startsWith('\xaa')) {
+            // We might have a split MediaMessage, wait for more data
+            while (mid.size() < sizeof(MediaMessage)) {
+                m_socket->waitForReadyRead();
+                data.append(m_socket->readAll());
+                mid = data.mid(offset);
+            }
+            offset += processMessage(mid);
+        } else {
+            offset += emitData(mid);
+        }
     }
 }
 
 void BubbleCamClient::onDisconnected()
 {
     if (m_socket) {
-        DEBUG << "Socket disconnected" << m_socket->errorString();
+        INFO << "Socket disconnected" << m_socket->errorString();
     } else {
-        DEBUG << "Socket disconnected";
+        INFO << "Socket disconnected";
     }
     stopStreaming();
 }
@@ -390,19 +416,19 @@ void BubbleCamClient::onDisconnected()
 void BubbleCamClient::onError(QAbstractSocket::SocketError socketError)
 {
     if (m_socket) {
-        DEBUG << "Socket error" << socketError << m_socket->errorString();
+        WARNING << "Socket error" << socketError << m_socket->errorString();
     } else {
-        DEBUG << "Socket error" << socketError;
+        WARNING << "Socket error" << socketError;
     }
-    // TODO
+    stopStreaming();
 }
 
-void BubbleCamClient::onHeartbeatTimeout()
+void BubbleCamClient::onHeartbeatTimerTimeout()
 {
-    DEBUG << "Heartbeat";
+    INFO << "Sending heartbeat";
 
     HeartbeatMessage heartbeat;
     QByteArray heartbeat_package(reinterpret_cast<char *>(&heartbeat), sizeof(HeartbeatMessage));
-    DEBUG << heartbeat_package.size() << heartbeat_package.toHex(' ');
+    DEBUG << heartbeat_package.size() << heartbeat_package.toHex();
     m_socket->write(heartbeat_package);
 }

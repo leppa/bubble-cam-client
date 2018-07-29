@@ -46,6 +46,7 @@ class BubbleCamClient : public QObject
 public:
     enum struct ErrorCode : quint8 {
         NoError = 0x00,
+        AlreadyStreaming,
         UsernameOrPasswordTooLong,
         ConnectionTimeout = 0x10,
         ReadTimeout,
@@ -78,7 +79,7 @@ private slots:
     void onReadyRead();
     void onDisconnected();
     void onError(QAbstractSocket::SocketError socketError);
-    void onHeartbeatTimeout();
+    void onHeartbeatTimerTimeout();
 
 private:
     bool m_streaming = false;
@@ -87,7 +88,7 @@ private:
     QScopedPointer<QTcpSocket> m_socket;
     QScopedPointer<QTimer> m_heartbeatTimer;
 
-    quint32 packet_left = 0;
+    qint32 packet_left = 0;
     bool audioActive = false;
 
     int processMessage(const QByteArray &data);
